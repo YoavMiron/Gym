@@ -26,8 +26,10 @@ rate-limit statuses; 404 and 408 never trigger that extension.
 ## Reasoning items from gateways
 
 LiteLLM-style gateways (for example in front of Anthropic and Google models)
-return Responses API `reasoning` output items with `summary: null` and the
-reasoning text in `output_text` content parts. The Responses schema, and so
+return Responses API `reasoning` output items whose `summary` is null or absent
+(Gym's own client saw the key missing: `output.0.reasoning.summary Field
+required`; the `openai` client's dump of the same bodies shows `summary: null`)
+and the reasoning text in `output_text` content parts. The Responses schema, and so
 `NeMoGymResponse`, requires `summary` to be a list and those parts to be
 `reasoning_text`, so every such response failed validation and its rollout was
 lost. `normalize_reasoning_items` (default `true`) repairs exactly those two
