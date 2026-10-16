@@ -1,0 +1,92 @@
+{
+  "id": "resp_fixture_gemini",
+  "created_at": 1792150822.0,
+  "error": null,
+  "incomplete_details": null,
+  "instructions": null,
+  "metadata": {},
+  "model": "gcp/google/gemini-4-argon",
+  "object": "response",
+  "output": [
+    {
+      "id": "reasoning_fixture_gemini_0",
+      "summary": null,
+      "type": "reasoning",
+      "content": [
+        {
+          "text": "Shortened reasoning text.",
+          "type": "output_text",
+          "annotations": []
+        }
+      ],
+      "encrypted_content": null,
+      "status": "completed",
+      "role": "assistant",
+      "phase": null
+    },
+    {
+      "id": "message_fixture_gemini_1",
+      "content": [
+        {
+          "annotations": [],
+          "text": "Explanation: shortened.\nAnswer: shortened\nConfidence: 90%",
+          "type": "output_text",
+          "logprobs": null
+        }
+      ],
+      "role": "assistant",
+      "status": "completed",
+      "type": "message",
+      "phase": null
+    }
+  ],
+  "parallel_tool_calls": false,
+  "temperature": 0.0,
+  "tool_choice": "auto",
+  "tools": [],
+  "top_p": null,
+  "background": null,
+  "completed_at": null,
+  "conversation": null,
+  "max_output_tokens": null,
+  "max_tool_calls": null,
+  "moderation": null,
+  "previous_response_id": null,
+  "prompt": null,
+  "prompt_cache_key": null,
+  "prompt_cache_retention": null,
+  "reasoning": null,
+  "safety_identifier": null,
+  "service_tier": null,
+  "status": "completed",
+  "text": {
+    "format": null,
+    "verbosity": null
+  },
+  "top_logprobs": null,
+  "truncation": null,
+  "usage": {
+    "input_tokens": 213,
+    "input_tokens_details": {
+      "cached_tokens": 0,
+      "audio_tokens": null,
+      "cached_tokens_details": null,
+      "image_tokens": null,
+      "text_tokens": 213,
+      "video_tokens": null
+    },
+    "output_tokens": 12398,
+    "output_tokens_details": {
+      "reasoning_tokens": 9041,
+      "audio_tokens": null,
+      "text_tokens": 3357
+    },
+    "total_tokens": 12611,
+    "cost": null
+  },
+  "user": null,
+  "store": null,
+  "provider_specific_fields": {
+    "traffic_type": "ON_DEMAND"
+  }
+}

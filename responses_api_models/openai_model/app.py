@@ -55,6 +55,45 @@ class UpstreamRetriesExhaustedError(RuntimeError):
         self.response_content = getattr(last_error, "response_content", None)
 
 
+def normalize_reasoning_items(response_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Return ``response_dict`` with gateway-shaped ``reasoning`` output items repaired.
+
+    LiteLLM-style gateways (for example in front of Anthropic and Google models) emit Responses API
+    reasoning items with ``summary: null`` and the reasoning text in ``output_text`` content parts,
+    while ``NeMoGymResponseReasoningItem`` requires ``summary`` to be a list and the parts to be
+    ``reasoning_text``. Exactly those two shapes change: a missing or null ``summary`` becomes ``[]``
+    and ``output_text`` parts of a reasoning item become ``reasoning_text``. Every other item, field
+    and part (``encrypted_content`` included) is returned as received, and the input is not mutated.
+    """
+    output = response_dict.get("output")
+    if not isinstance(output, list):
+        return response_dict
+
+    changed = False
+    normalized_output = []
+    for item in output:
+        if not (isinstance(item, dict) and item.get("type") == "reasoning"):
+            normalized_output.append(item)
+            continue
+        normalized_item = dict(item)
+        if normalized_item.get("summary") is None:
+            normalized_item["summary"] = []
+        content = normalized_item.get("content")
+        if isinstance(content, list):
+            normalized_item["content"] = [
+                {**part, "type": "reasoning_text"}
+                if isinstance(part, dict) and part.get("type") == "output_text"
+                else part
+                for part in content
+            ]
+        changed = changed or normalized_item != item
+        normalized_output.append(normalized_item)
+
+    if not changed:
+        return response_dict
+    return {**response_dict, "output": normalized_output}
+
+
 class UpstreamRetryPolicy(BaseModel):
     """Retry policy for one logical request to the upstream provider."""
 
@@ -211,6 +250,16 @@ class SimpleModelServerConfig(BaseResponsesAPIModelConfig):
             "items when echoed back across tool-use turns."
         ),
     )
+    normalize_reasoning_items: bool = Field(
+        default=True,
+        description=(
+            "Repair type=reasoning output items from LiteLLM-style gateways before "
+            "the upstream response is validated: a missing or null `summary` becomes "
+            "[] and `output_text` content parts become `reasoning_text`. Nothing else "
+            "changes (encrypted_content is kept). On by default because it only widens "
+            "acceptance; false surfaces the raw provider shape as a validation error."
+        ),
+    )
 
 
 class SimpleModelServer(SimpleResponsesAPIModel):
@@ -335,6 +384,8 @@ class SimpleModelServer(SimpleResponsesAPIModel):
 
         async def create_and_validate() -> NeMoGymResponse:
             response_dict = await self._client.create_response(**body_dict)
+            if self.config.normalize_reasoning_items and isinstance(response_dict, dict):
+                response_dict = normalize_reasoning_items(response_dict)
             reasoning = response_dict.get("reasoning") if isinstance(response_dict, dict) else None
             if (
                 self.config.reasoning_effort_none_replacement is not None
