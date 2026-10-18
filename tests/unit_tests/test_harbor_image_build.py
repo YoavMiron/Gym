@@ -265,6 +265,60 @@ class TestPlan:
         (plan,) = plan_builds(task)
         assert plan.tasks == ("solo",)
 
+    def test_force_builds_the_dockerfile_of_a_task_that_declares_an_image(self, tmp_path):
+        # Harbor's --force-build: SWE-Interact's declared images lack what its Dockerfiles COPY in.
+        folder = tmp_path / "ds"
+        write_task(folder / "e", toml=TOML + 'docker_image = "org/prebuilt:1"\n')
+        assert plan_builds(folder) == []
+        (entry,) = plan_builds(folder, force=True)
+        assert (entry.tasks, entry.service) == (("e",), "main")
+
+    def test_a_recorded_build_wins_over_the_declared_image(self, tmp_path):
+        folder = tmp_path / "ds"
+        task_dir = write_task(folder / "e", toml=TOML + 'docker_image = "org/prebuilt:1"\n')
+        assert load_task(task_dir).image == "org/prebuilt:1"
+        built = f"{REPO}/hb__{'2' * 32}@sha256:{'f' * 64}"
+        (folder / BUILT_IMAGES_FILE).write_text(
+            json.dumps({context_digest(task_dir / "environment"): {"image": built}})
+        )
+        assert load_task(task_dir).image == built
+
+    def test_each_sidecar_build_context_is_planned_under_its_service(self, tmp_path):
+        folder = tmp_path / "ds"
+        compose = (
+            "services:\n  main:\n    image: ${MAIN_IMAGE_NAME}\n"
+            "  user-server:\n    build:\n      context: ./user-server\n"
+            "    environment:\n      - LITELLM_API_KEY=${LITELLM_API_KEY}\n"
+        )
+        extra = {"docker-compose.yaml": compose, "user-server/Dockerfile": "FROM python:3.12-slim\n"}
+        write_task(folder / "a", extra=extra)
+        write_task(folder / "b", extra=extra)  # same sidecar context content: one build
+        plan = plan_builds(folder)
+        sidecar = next(entry for entry in plan if entry.service == "user-server")
+        assert sidecar.tasks == ("a", "b")
+        assert sidecar.context == (folder / "a" / "environment" / "user-server").resolve()
+        assert sidecar.digest == harbor_hash(sidecar.context)
+
+    def test_a_sidecar_context_builds_from_its_own_dockerfile(self, tmp_path):
+        folder = tmp_path / "ds"
+        compose = "services:\n  main:\n    image: ${MAIN_IMAGE_NAME}\n  db:\n    build: ./db\n"
+        write_task(
+            folder / "a",
+            dockerfile=PULL_DOCKERFILE,
+            extra={"docker-compose.yaml": compose, "db/Dockerfile": "FROM x\n"},
+        )
+        write_base_record(folder)
+        builder, tool = tagged_buildah(tmp_path)
+        (result,) = build_images(folder, builder=builder, log=lambda _: None)
+        bud = next(call for call in tool.calls if "bud" in call)
+        assert bud[-3:] == [
+            "-f",
+            str((folder / "a" / "environment" / "db" / "Dockerfile").resolve()),
+            str((folder / "a" / "environment" / "db").resolve()),
+        ]
+        recorded = json.loads((folder / BUILT_IMAGES_FILE).read_text())
+        assert recorded[result.digest]["image"] == result.image
+
     def test_detect_tool_needs_docker_without_a_repository(self, monkeypatch):
         monkeypatch.setattr(
             shutil, "which", lambda name: f"/usr/bin/{name}" if name in ("buildah", "podman") else None
@@ -686,18 +740,24 @@ class TestDockerComposeBackend:
         assert build["env"]["MAIN_IMAGE_NAME"] == result.tag and build["env"]["CONTEXT_DIR"] == str(context)
         assert lines == [f"Built {result.image} (local, docker) for task(s) a"]
 
-    @pytest.mark.parametrize(
-        ("sidecar", "message"),
-        [
-            ("  db:\n    build: ./db\n", r"service 'db' has a build section; sidecars must name a prebuilt image:"),
-            ("  db:\n    image: hb-db\n    build: ./db\n", r"service 'db' has a build section"),
-        ],
-    )
-    def test_a_sidecar_with_a_build_section_is_refused_before_any_build(self, tmp_path, fake_docker, sidecar, message):
+    def test_main_alone_is_compose_built_when_a_sidecar_builds_on_its_own(self, tmp_path):
         folder = tmp_path / "ds"
-        compose = "services:\n  main:\n    image: ${MAIN_IMAGE_NAME}\n" + sidecar
+        compose = "services:\n  main:\n    image: ${MAIN_IMAGE_NAME}\n  db:\n    build: ./db\n"
         write_task(folder / "a", extra={"docker-compose.yaml": compose, "db/Dockerfile": "FROM postgres:16\n"})
-        with pytest.raises(BuildError, match=message):
+        main = next(entry for entry in plan_builds(folder) if entry.service == "main")
+        builder, _ = local_docker()
+        assert builder.compose_build_argv(main, tmp_path / "harbor.yaml")[-2:] == ["build", "main"]
+
+    def test_a_sidecar_build_reaching_the_host_is_refused_before_any_build(self, tmp_path, fake_docker):
+        folder = tmp_path / "ds"
+        compose = (
+            "services:\n  main:\n    image: ${MAIN_IMAGE_NAME}\n"
+            "  db:\n    build:\n      context: ./db\n      ssh: [default]\n"
+        )
+        write_task(folder / "a", extra={"docker-compose.yaml": compose, "db/Dockerfile": "FROM postgres:16\n"})
+        # The sidecar is not planned (a sidecar build takes a context only); main's compose check refuses the key.
+        assert [entry.service for entry in plan_builds(folder)] == ["main"]
+        with pytest.raises(BuildError, match=r"services\.db\.build\.ssh is refused"):
             build_images(folder, builder=ImageBuilder(tool="docker"), log=lambda _: None)
         assert [c["argv"] for c in fake_docker()] == [["compose", "version"]]
         assert not (folder / BUILT_IMAGES_FILE).exists()
@@ -1330,6 +1390,10 @@ class TestBuildOptions:
             BuildOptions.from_config({"builds": {"tool": "kaniko"}})
         with pytest.raises(ValueError, match="`builds.enabled` must be true or false; got 'no'"):
             BuildOptions.from_config({"builds": {"enabled": "no"}})
+        with pytest.raises(ValueError, match="`builds.force` must be true or false; got 'yes'"):
+            BuildOptions.from_config({"builds": {"force": "yes"}})
+        assert BuildOptions.from_config({"builds": {"force": True}}).force is True
+        assert BuildOptions.from_config({}).force is False
         with pytest.raises(ValueError, match="`builds.platform` must be a string; got 1"):
             BuildOptions.from_config({"builds": {"platform": 1}})
         with pytest.raises(ValueError, match="`builds` must be a mapping of tool, repository, platform, enabled"):

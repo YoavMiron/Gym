@@ -92,7 +92,7 @@ AGENT_OVERRIDES: dict[str, dict[str, Any]] = {
 
 # The top-level configuration block that sets Dockerfile builds up, and the settings it takes.
 BUILDS_KEY = "builds"
-BUILD_SETTINGS = ("tool", "repository", "platform", "enabled")
+BUILD_SETTINGS = ("tool", "repository", "platform", "enabled", "force")
 HYDRA_QUIET_OVERRIDES = (
     "hydra.run.dir=.",
     "hydra.output_subdir=null",
@@ -109,13 +109,16 @@ class BuildOptions:
     :func:`nemo_gym.tasks.harbor.image_build.detect_tool`). ``repository`` is the registry path built
     images are pushed under (default: the ``NEMO_GYM_BUILD_REPOSITORY`` variable; unset keeps them local
     in the Docker daemon). ``platform`` is passed to the tool (default ``linux/amd64``). With ``enabled``
-    false nothing is built, and the tasks that need a build are skipped with the loader's message.
+    false nothing is built, and the tasks that need a build are skipped with the loader's message. With
+    ``force``, a task's Dockerfile is built even when the task declares ``[environment].docker_image``, as
+    Harbor's ``--force-build`` does, and the task then runs the built image.
     """
 
     enabled: bool = True
     tool: str | None = None
     repository: str | None = None
     platform: str | None = None
+    force: bool = False
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any] | None) -> "BuildOptions":
@@ -135,17 +138,19 @@ class BuildOptions:
             raise ValueError(
                 f"Unknown `{BUILDS_KEY}` setting(s) {', '.join(unknown)}; expected {', '.join(BUILD_SETTINGS)}"
             )
-        enabled = block.get("enabled", True)
-        if not isinstance(enabled, bool):
-            raise ValueError(f"`{BUILDS_KEY}.enabled` must be true or false; got {enabled!r}")
+        flags = {name: block.get(name, default) for name, default in (("enabled", True), ("force", False))}
+        for name, value in flags.items():
+            if not isinstance(value, bool):
+                raise ValueError(f"`{BUILDS_KEY}.{name}` must be true or false; got {value!r}")
         tool = _build_setting(block, "tool")
         if tool is not None and tool not in BUILD_TOOLS:
             raise ValueError(f"`{BUILDS_KEY}.tool` must be one of {', '.join(BUILD_TOOLS)}; got {tool!r}")
         return cls(
-            enabled=enabled,
+            enabled=flags["enabled"],
             tool=tool,
             repository=_build_setting(block, "repository") or os.environ.get(REPOSITORY_ENV) or None,
             platform=_build_setting(block, "platform"),
+            force=flags["force"],
         )
 
 
@@ -322,7 +327,7 @@ def _build_dockerfiles(folder: Path, build: BuildOptions, *, select) -> None:
     With builds disabled, the tasks that need one are left for the loader to skip with its
     message. A missing builder or a failed build stops the preparation, naming the tasks.
     """
-    plan = plan_builds(folder, select=select)
+    plan = plan_builds(folder, select=select, force=build.force)
     if not plan:
         return
     names = ", ".join(task for entry in plan for task in entry.tasks[:3])
@@ -338,7 +343,7 @@ def _build_dockerfiles(folder: Path, build: BuildOptions, *, select) -> None:
         return
     try:
         builder = ImageBuilder(tool=build.tool, repository=build.repository, platform=build.platform)
-        results = build_images(folder, builder=builder, select=select)
+        results = build_images(folder, builder=builder, select=select, force=build.force)
     except BuildError as exc:
         raise ValueError(f"Could not build the Dockerfile image(s) for task(s) {names}: {exc}") from exc
     if not results:

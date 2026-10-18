@@ -78,7 +78,12 @@ from typing import Any, Callable
 
 import yaml
 
-from nemo_gym.sandbox.compose_config import ComposeSubstitutionError, env_file_entries, substitute_compose
+from nemo_gym.sandbox.compose_config import (
+    ComposeSubstitutionError,
+    blank_unresolved_environment,
+    env_file_entries,
+    substitute_compose,
+)
 from nemo_gym.tasks.harbor.dataset_config import apply_dataset_config, read_dataset_config
 from nemo_gym.tasks.harbor.digest import context_digest
 from nemo_gym.tasks.harbor.dockerfile import (
@@ -89,7 +94,14 @@ from nemo_gym.tasks.harbor.dockerfile import (
     resolve_dockerfile,
 )
 from nemo_gym.tasks.harbor.harbor_compat import sanitize_docker_image_name
-from nemo_gym.tasks.harbor.image_configs import COMPOSE_FILE_NAMES, LOG_MOUNT_PATHS, PLATFORM, RECORDED_CONFIG_KEYS
+from nemo_gym.tasks.harbor.image_configs import (
+    COMPOSE_FILE_NAMES,
+    LOG_MOUNT_PATHS,
+    PLATFORM,
+    RECORDED_CONFIG_KEYS,
+    ImageConfigError,
+    sidecar_build_contexts,
+)
 from nemo_gym.tasks.harbor.task import (
     BUILT_IMAGES_FILE,
     DOCKERFILE,
@@ -221,16 +233,52 @@ class BuildPlanEntry:
     env: dict[str, str] = field(default_factory=dict)
     cpus: int | None = None
     memory_mb: int | None = None
+    # The Compose service the context builds: ``main`` (the task's Dockerfile) or a sidecar with a ``build:``.
+    service: str = MAIN_SERVICE
 
 
-def plan_builds(folder: Path, *, select: Callable[[str], bool] | None = None) -> list[BuildPlanEntry]:
-    """The distinct build contexts among the tasks under ``folder`` whose Dockerfile needs a build.
+def _sidecar_contexts(task_folder: Path) -> dict[str, Path]:
+    """The build context of each sidecar with a ``build:`` in the task's Compose file, by service name.
+
+    Only the ``build:`` values are interpolated (``${CONTEXT_DIR}`` is the task's ``environment/``), so a
+    variable elsewhere in the file, such as one left to the deployment, does not stop the plan. A file or a
+    sidecar build this cannot read is logged and left for the loader to report.
+    """
+    environment_dir = task_folder / "environment"
+    try:
+        path = task_compose_file(environment_dir)
+    except BuildError as exc:
+        # Refused again, with the same message, when the task's own build runs.
+        LOGGER.warning("%s: sidecar builds not planned: %s", environment_dir, exc)
+        return {}
+    if path is None:
+        return {}
+    try:
+        document = yaml.safe_load(path.read_text()) or {}
+        services = document.get("services") if isinstance(document, dict) else None
+        builds = {
+            str(name): {"build": substitute_compose(service["build"], {"CONTEXT_DIR": str(environment_dir)})}
+            for name, service in (services.items() if isinstance(services, dict) else ())
+            if name != MAIN_SERVICE and isinstance(service, dict) and service.get("build") is not None
+        }
+        return sidecar_build_contexts({"services": builds}, environment_dir)
+    except (yaml.YAMLError, UnicodeDecodeError, ComposeSubstitutionError, ImageConfigError) as exc:
+        LOGGER.warning("%s: sidecar builds not planned: %s", path, exc)
+        return {}
+
+
+def plan_builds(
+    folder: Path, *, select: Callable[[str], bool] | None = None, force: bool = False
+) -> list[BuildPlanEntry]:
+    """The distinct build contexts among the tasks under ``folder`` that need a build.
 
     ``folder`` is a task folder or a folder of task folders; ``select`` limits the scan to the
-    tasks whose folder name it accepts. A task counts when it has ``environment/Dockerfile``,
-    declares no ``[environment].docker_image`` after the dataset's overrides, and the Dockerfile
-    is outside pull and overlay mode. Tasks whose ``task.toml`` does not load are left for the
-    loader to report. Entries are ordered by the first task that uses them.
+    tasks whose folder name it accepts. A task's Dockerfile counts when it is outside pull and overlay
+    mode and the task declares no ``[environment].docker_image`` after the dataset's overrides, or
+    whenever ``force`` is set: Harbor's ``--force-build`` builds the Dockerfile instead of pulling the
+    declared image, and the loader then runs the recorded build. Each Compose sidecar with a ``build:``
+    section contributes its own context (``service`` names it). Tasks whose ``task.toml`` does not load
+    are left for the loader to report. Entries are ordered by the first task that uses them.
     """
     folder = Path(folder).resolve()
     single = is_task_folder(folder)
@@ -245,9 +293,16 @@ def plan_builds(folder: Path, *, select: Callable[[str], bool] | None = None) ->
     entries: dict[str, list[str]] = {}
     contexts: dict[str, Path] = {}
     settings: dict[str, tuple[dict[str, str], int | None, int | None]] = {}
+    services: dict[str, str] = {}
     for child in children:
         if not is_task_folder(child) or (select is not None and not select(child.name)):
             continue
+        for service, context in _sidecar_contexts(child).items():
+            digest = context_digest(context)
+            entries.setdefault(digest, []).append(child.name)
+            contexts.setdefault(digest, context)
+            settings.setdefault(digest, ({}, None, None))
+            services.setdefault(digest, service)
         dockerfile = child / DOCKERFILE
         if not dockerfile.is_file():
             continue
@@ -257,7 +312,7 @@ def plan_builds(folder: Path, *, select: Callable[[str], bool] | None = None) ->
             text = dockerfile.read_text()
         except (tomllib.TOMLDecodeError, UnicodeDecodeError, ValueError):
             continue
-        if config.environment.docker_image or not needs_build(text, image_configs):
+        if (config.environment.docker_image and not force) or not needs_build(text, image_configs):
             continue
         digest = context_digest(dockerfile.parent)
         environment = config.environment
@@ -282,8 +337,10 @@ def plan_builds(folder: Path, *, select: Callable[[str], bool] | None = None) ->
         entries.setdefault(digest, []).append(child.name)
         contexts.setdefault(digest, dockerfile.parent)
         settings.setdefault(digest, declared)
+        services.setdefault(digest, MAIN_SERVICE)
     return [
-        BuildPlanEntry(digest, contexts[digest], tuple(tasks), *settings[digest]) for digest, tasks in entries.items()
+        BuildPlanEntry(digest, contexts[digest], tuple(tasks), *settings[digest], service=services[digest])
+        for digest, tasks in entries.items()
     ]
 
 
@@ -452,10 +509,11 @@ def validate_task_compose(context: Path, env: dict[str, str]) -> dict[str, Any] 
     could not resolve is refused rather than left to Compose's empty-string default, so the document checked is
     the document built. ``main``'s ``image`` is checked on the raw text, as the rule is about the spelling.
 
-    A sidecar with a ``build`` section is refused: the loader records a sidecar from its ``image:`` (one
-    without is refused as "builds are not supported") and no provider starts a locally built sidecar, so
-    building it here would spend the time on an image nothing uses, or on one that then differs from the
-    registry image the task runs with. Sidecars name a prebuilt ``image:`` and carry no ``build:``.
+    A sidecar's ``build`` section passes the same checks. Its context is built on its own (a
+    :class:`BuildPlanEntry` with that ``service``, see :func:`plan_builds`), never by this compose build,
+    which then names ``main`` alone. A name used only in a service's ``environment`` and set nowhere in the
+    build's variables is left blank here: an environment value cannot change what is built, and the deployment
+    fills such names (a sidecar's model key) when the group starts.
     """
     path = task_compose_file(context)
     if path is None:
@@ -478,7 +536,9 @@ def validate_task_compose(context: Path, env: dict[str, str]) -> dict[str, Any] 
             f"Dockerfile build, not {main_image!r}"
         )
     try:
-        document = substitute_compose(document, compose_interpolation_variables(context, env))
+        variables = compose_interpolation_variables(context, env)
+        blank_unresolved_environment(document, variables)
+        document = substitute_compose(document, variables)
     except ComposeSubstitutionError as exc:
         raise BuildError(
             f"{path}: interpolation is refused for a Dockerfile build: {exc}. Every variable the file reads has to "
@@ -498,12 +558,6 @@ def validate_task_compose(context: Path, env: dict[str, str]) -> dict[str, Any] 
         build = service.get("build")
         if build is None:
             continue
-        if service_name != MAIN_SERVICE:
-            raise BuildError(
-                f"{path}: service {service_name!r} has a build section; sidecars must name a prebuilt image: and "
-                "carry no build: (the loader records a sidecar's image from the registry and no provider starts a "
-                f"locally built one). Only {MAIN_SERVICE} is built, from environment/Dockerfile."
-            )
         if isinstance(build, str):
             build = {"context": build}
         if not isinstance(build, dict):
@@ -705,7 +759,8 @@ class ImageBuilder:
         ``<project>-<service>``; ``main`` is named explicitly, see :func:`harbor_compose_document`); the
         project directory is the context, so relative paths in the task's Compose file resolve as Harbor
         resolves them; the files are Harbor's build template, then the task's ``docker-compose.yaml`` when
-        it has one, in Harbor's order.
+        it has one, in Harbor's order. When a sidecar has a ``build`` section too, the line names ``main``:
+        each sidecar context is built on its own (see :func:`plan_builds`).
         """
         argv = [
             "docker",
@@ -720,7 +775,8 @@ class ImageBuilder:
         task_compose = task_compose_file(entry.context)
         if task_compose is not None:
             argv += ["-f", str(task_compose)]
-        return [*argv, "build"]
+        sidecars = _sidecar_contexts(entry.context.parent) if task_compose is not None else {}
+        return [*argv, "build", *([MAIN_SERVICE] if sidecars else [])]
 
     def push_argv(self, tag: str, digest_file: Path) -> list[str]:
         if self.tool == "buildah":
@@ -789,7 +845,12 @@ class ImageBuilder:
         tag = self.tag_for(entry)
         tasks = ", ".join(entry.tasks[:5])
         what = f"Building {tag} for task(s) {tasks}"
-        if self.tool == "docker":
+        if entry.service != MAIN_SERVICE:
+            # A sidecar context builds from its own Dockerfile with every tool; Harbor's compose build file
+            # describes main only.
+            what += f" (Compose service {entry.service})"
+            self._check(self.build_argv(entry, tag), what, env=self.tool_env())
+        elif self.tool == "docker":
             self._ensure_compose_plugin()
             env = compose_build_env(entry, tag, self.platform)
             # Checked as docker compose will read it: interpolated against the build's own environment.
@@ -1000,6 +1061,7 @@ def build_images(
     builder: ImageBuilder,
     select: Callable[[str], bool] | None = None,
     log: Callable[[str], None] = print,
+    force: bool = False,
 ) -> list[BuildResult]:
     """Build and record every context under ``folder`` that needs it and has no usable record.
 
@@ -1007,12 +1069,13 @@ def build_images(
     and of the requested platform. Otherwise it is rebuilt and its record replaced, and the reason
     is logged. A context is keyed by its content hash, so a changed build context is a new build;
     deleting a context's entry from ``built-images.json`` forces one for an unchanged context.
+    ``force`` also builds the Dockerfiles of tasks that declare an image (see :func:`plan_builds`).
     Returns the images built by this call. Raises :class:`BuildError` on the first failure, after
     recording whatever was built before it.
     """
     folder = Path(folder).resolve()
     parent = folder.parent if is_task_folder(folder) else folder
-    plan = plan_builds(folder, select=select)
+    plan = plan_builds(folder, select=select, force=force)
     if not plan:
         return []
     recorded = read_built_images(parent)

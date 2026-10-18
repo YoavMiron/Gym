@@ -34,13 +34,23 @@ import yaml
 
 from nemo_gym.sandbox.compose_config import (
     ComposeSubstitutionError,
+    blank_unresolved_environment,
     inline_env_files,
     residual_interpolation,
     substitute_compose,
 )
 from nemo_gym.tasks.harbor.dataset_config import apply_dataset_config, read_dataset_config
+from nemo_gym.tasks.harbor.digest import context_digest
 from nemo_gym.tasks.harbor.models import HarborTaskConfig
-from nemo_gym.tasks.harbor.task import IMAGE_CONFIGS_FILE, TASK_FILE, HarborTask, dockerfile_base_image, is_task_folder
+from nemo_gym.tasks.harbor.task import (
+    BUILT_IMAGES_FILE,
+    IMAGE_CONFIGS_FILE,
+    TASK_FILE,
+    HarborTask,
+    dockerfile_base_image,
+    is_task_folder,
+    read_built_images,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -264,34 +274,6 @@ def compose_variables(task: HarborTask) -> dict[str, str]:
     return variables
 
 
-def _blank_deployment_values(document: dict[str, Any], variables: dict[str, str]) -> list[str]:
-    """Blank the service ``environment`` values that name a variable neither the task nor Harbor defines.
-
-    Those are left to the deployment (the environment server's ``compose_variables``). Prepare reads the
-    document only for the images it starts and its structure, which an environment value cannot change, and
-    the server reads the file again at seed with the deployment's values. Returns the names, for the log.
-    """
-    names: list[str] = []
-    services = document.get("services")
-    for service in (services or {}).values() if isinstance(services, dict) else ():
-        environment = service.get("environment") if isinstance(service, dict) else None
-        if isinstance(environment, list):
-            for index, entry in enumerate(environment):
-                try:
-                    substitute_compose(entry, variables)
-                except ComposeSubstitutionError as exc:
-                    names.append(exc.name)
-                    environment[index] = str(entry).split("=", 1)[0] + "="
-        elif isinstance(environment, dict):
-            for key, value in environment.items():
-                try:
-                    substitute_compose(value, variables)
-                except ComposeSubstitutionError as exc:
-                    names.append(exc.name)
-                    environment[key] = ""
-    return names
-
-
 def load_compose_document(
     task: HarborTask, *, operator_variables: Mapping[str, str] | None = None
 ) -> dict[str, Any] | None:
@@ -317,7 +299,8 @@ def load_compose_document(
         # literal. Anything still carrying a ``$NAME`` afterwards fails here, at prepare, not at seed.
         variables = compose_variables(task)
         if operator_variables is None:
-            deferred = _blank_deployment_values(document, variables)
+            # Prepare reads the document for its images and structure; the server fills these at seed.
+            deferred = blank_unresolved_environment(document, variables)
             if deferred:
                 LOGGER.info(f"{task.task_id}: {path.name} leaves {sorted(set(deferred))} to the deployment")
         else:
@@ -329,6 +312,64 @@ def load_compose_document(
     residual = residual_interpolation(document)
     if residual is not None:
         raise ImageConfigError(f"{task.task_id}: {path.name}: unresolved interpolation left in {residual!r}")
+    return with_built_sidecars(document, task)
+
+
+def sidecar_build_context(service: str, build: Any, environment_dir: Path) -> Path:
+    """The folder a sidecar's ``build:`` builds: a context inside the task's ``environment/`` with a ``Dockerfile``.
+
+    Only ``context`` and the default ``dockerfile`` are supported for a sidecar; anything else (args, a target,
+    another Dockerfile, a context outside ``environment/``) raises :class:`ImageConfigError` naming it.
+    """
+    if isinstance(build, str):
+        build = {"context": build}
+    if not isinstance(build, dict) or set(build) - {"context", "dockerfile"}:
+        raise ImageConfigError(
+            f"Compose service {service!r}: a sidecar build takes only build.context (and the default dockerfile)"
+        )
+    if build.get("dockerfile", "Dockerfile") != "Dockerfile":
+        raise ImageConfigError(f"Compose service {service!r}: a sidecar builds from its context's Dockerfile only")
+    root = Path(environment_dir).resolve()
+    context = (root / str(build.get("context", "."))).resolve()
+    if context != root and root not in context.parents:
+        raise ImageConfigError(f"Compose service {service!r}: build.context {context} is outside {root}")
+    if not (context / "Dockerfile").is_file():
+        raise ImageConfigError(f"Compose service {service!r}: no Dockerfile in {context}")
+    return context
+
+
+def sidecar_build_contexts(document: dict[str, Any], environment_dir: Path) -> dict[str, Path]:
+    """The build context of every sidecar (a service other than ``main``) with a ``build:`` section."""
+    services = document.get("services") if isinstance(document, dict) else None
+    return {
+        str(name): sidecar_build_context(str(name), service["build"], environment_dir)
+        for name, service in (services.items() if isinstance(services, dict) else ())
+        if name != "main" and isinstance(service, dict) and service.get("build") is not None
+    }
+
+
+def with_built_sidecars(document: dict[str, Any], task: HarborTask) -> dict[str, Any]:
+    """``document`` with each sidecar's ``build:`` replaced by the image prepare built from that context.
+
+    Prepare builds a sidecar's context once, like ``main``'s Dockerfile, and records it in
+    ``built-images.json`` by Harbor's hash of the context; the sandbox Compose adapter starts images only. A
+    sidecar whose build is not recorded raises :class:`ImageConfigError`.
+    """
+    contexts = sidecar_build_contexts(document, task.path / "environment")
+    if not contexts:
+        return document
+    recorded = read_built_images(task.path.parent)
+    for name, context in contexts.items():
+        entry = recorded.get(context_digest(context))
+        image = entry.get("image") if isinstance(entry, dict) else None
+        if not image:
+            raise ImageConfigError(
+                f"{task.task_id}: Compose service {name!r} builds {context} and no built image is recorded in "
+                f"{task.path.parent / BUILT_IMAGES_FILE}; prepare builds it when buildah, podman or docker is "
+                "configured (the builds: block)"
+            )
+        service = {key: value for key, value in document["services"][name].items() if key not in MAIN_BUILD_KEYS}
+        document["services"][name] = service | {"image": str(image)}
     return document
 
 
@@ -346,8 +387,8 @@ def without_main_build(document: dict[str, Any]) -> dict[str, Any]:
     ``hb__<hash>`` image for ``main`` (``MAIN_IMAGE_NAME`` resolves to it). The two keys describe a build that
     already happened; the sandbox Compose adapter starts images only and refuses them as unsupported fields,
     so they are dropped here rather than failing every episode of a task prepare accepted. Nothing else is
-    touched: a sidecar's ``build:`` is refused at prepare, and a task in pull or overlay mode keeps whatever
-    its file says, so an unsupported field there is still reported.
+    touched: a sidecar's ``build:`` gives way to its own recorded image (:func:`with_built_sidecars`), and a
+    task in pull or overlay mode keeps whatever its file says, so an unsupported field there is still reported.
     """
     services = document.get("services") if isinstance(document, dict) else None
     main = services.get("main") if isinstance(services, dict) else None
@@ -371,9 +412,7 @@ def compose_image_references(task: HarborTask) -> list[str]:
             continue
         image = (service or {}).get("image")
         if not image:
-            raise ImageConfigError(
-                f"{task.task_id}: Compose service {name!r} names no image; builds are not supported"
-            )
+            raise ImageConfigError(f"{task.task_id}: Compose service {name!r} names no image and no build")
         references.append(image)
     return list(dict.fromkeys(references))
 

@@ -273,6 +273,35 @@ def inline_env_files(document: dict, base_dir: Path, variables: dict[str, str] |
     return document
 
 
+def blank_unresolved_environment(document: dict, variables: dict[str, str]) -> list[str]:
+    """Blank the service ``environment`` values that name a variable ``variables`` does not define.
+
+    Such a value is left to the deployment that starts the document (the Harbor environment server's
+    ``compose_variables``). A reader that only needs the document's images and structure, which no
+    environment value can change, uses this before :func:`substitute_compose` so the deployment's
+    names do not fail it. Returns the names, for the log.
+    """
+    names: list[str] = []
+    services = document.get("services") if isinstance(document, dict) else None
+    for service in services.values() if isinstance(services, dict) else ():
+        environment = service.get("environment") if isinstance(service, dict) else None
+        if isinstance(environment, list):
+            for index, entry in enumerate(environment):
+                try:
+                    substitute_compose(entry, variables)
+                except ComposeSubstitutionError as exc:
+                    names.append(exc.name)
+                    environment[index] = str(entry).split("=", 1)[0] + "="
+        elif isinstance(environment, dict):
+            for key, value in environment.items():
+                try:
+                    substitute_compose(value, variables)
+                except ComposeSubstitutionError as exc:
+                    names.append(exc.name)
+                    environment[key] = ""
+    return names
+
+
 def residual_interpolation(value: Any) -> str | None:
     """The first ``$NAME`` or ``${...}`` still present in a document after substitution, or ``None``."""
     if isinstance(value, str):
