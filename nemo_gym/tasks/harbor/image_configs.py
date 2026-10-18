@@ -28,7 +28,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import yaml
 
@@ -264,12 +264,47 @@ def compose_variables(task: HarborTask) -> dict[str, str]:
     return variables
 
 
-def load_compose_document(task: HarborTask) -> dict[str, Any] | None:
+def _blank_deployment_values(document: dict[str, Any], variables: dict[str, str]) -> list[str]:
+    """Blank the service ``environment`` values that name a variable neither the task nor Harbor defines.
+
+    Those are left to the deployment (the environment server's ``compose_variables``). Prepare reads the
+    document only for the images it starts and its structure, which an environment value cannot change, and
+    the server reads the file again at seed with the deployment's values. Returns the names, for the log.
+    """
+    names: list[str] = []
+    services = document.get("services")
+    for service in (services or {}).values() if isinstance(services, dict) else ():
+        environment = service.get("environment") if isinstance(service, dict) else None
+        if isinstance(environment, list):
+            for index, entry in enumerate(environment):
+                try:
+                    substitute_compose(entry, variables)
+                except ComposeSubstitutionError as exc:
+                    names.append(exc.name)
+                    environment[index] = str(entry).split("=", 1)[0] + "="
+        elif isinstance(environment, dict):
+            for key, value in environment.items():
+                try:
+                    substitute_compose(value, variables)
+                except ComposeSubstitutionError as exc:
+                    names.append(exc.name)
+                    environment[key] = ""
+    return names
+
+
+def load_compose_document(
+    task: HarborTask, *, operator_variables: Mapping[str, str] | None = None
+) -> dict[str, Any] | None:
     """The task's Compose overlay with ``env_file`` entries inlined and ``${VAR}`` references resolved.
 
-    Returns ``None`` for a task without a Compose file. Prepare and the resources server both read the
+    Returns ``None`` for a task without a Compose file. Prepare and the environment server both read the
     file through this function, so the document the sandbox starts is the one prepare validated. An
     unresolved variable or a missing ``env_file`` raises :class:`ImageConfigError` naming it.
+
+    ``operator_variables`` are the deployment's values, which the server resolves at seed: they fill the
+    names that neither the task nor Harbor's infrastructure variables define. Without them, as at prepare,
+    a name used only in a service's ``environment`` is left for the server to fill (SWE-Interact's simulated
+    user reads its model endpoint and key that way); a name used anywhere else still fails here.
     """
     path = compose_file(task)
     if path is None:
@@ -281,6 +316,12 @@ def load_compose_document(task: HarborTask) -> dict[str, Any] | None:
         # Interpolate first, as Compose does, so an env_file path may use ${CONTEXT_DIR}; env_file values are then
         # literal. Anything still carrying a ``$NAME`` afterwards fails here, at prepare, not at seed.
         variables = compose_variables(task)
+        if operator_variables is None:
+            deferred = _blank_deployment_values(document, variables)
+            if deferred:
+                LOGGER.info(f"{task.task_id}: {path.name} leaves {sorted(set(deferred))} to the deployment")
+        else:
+            variables = dict(operator_variables) | variables
         document = substitute_compose(document, variables)
         document = inline_env_files(document, path.parent, variables)
     except ComposeSubstitutionError as exc:

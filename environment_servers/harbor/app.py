@@ -49,7 +49,7 @@ from uuid import uuid4
 import yaml
 from aiohttp import ClientConnectionError, ClientPayloadError, ClientResponseError
 from fastapi import Body, FastAPI, HTTPException
-from pydantic import BaseModel, ConfigDict, Field, PositiveFloat
+from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, model_validator
 
 from environment_servers.harbor.sandbox_io import (
     SandboxTransferError,
@@ -81,15 +81,21 @@ from nemo_gym.reward_profile import AggregateMetricsMixin, compute_aggregate_met
 from nemo_gym.rollout_observability import AgentObservationBundle
 from nemo_gym.sandbox import AsyncSandbox, AsyncSandboxCompose, SandboxExecResult, SandboxSpec, clamp_resource_requests
 from nemo_gym.sandbox.access import DirectSandboxConnection, SandboxAccess
+from nemo_gym.sandbox.agent_tools import sandbox_server_url
 from nemo_gym.sandbox.compose_config import adapt_non_root_sidecars, opensandbox_shm_labels, resolve_compose
 from nemo_gym.sandbox.config import resolve_provider_config, resolve_provider_metadata
 from nemo_gym.sandbox.providers.base import ORPHAN_REAP_TIMEOUT_S
-from nemo_gym.server_utils import get_response_json, is_nemo_gym_fastapi_entrypoint, raise_for_status
+from nemo_gym.server_utils import (
+    apply_rollout_prefix,
+    get_response_json,
+    is_nemo_gym_fastapi_entrypoint,
+    raise_for_status,
+)
 from nemo_gym.single_agent_turn_types import SingleAgentTurnFailure, SingleAgentTurnResult
 from nemo_gym.tasks.harbor import DIGEST_KEY, HarborTask, load_task
 from nemo_gym.tasks.harbor.dataset_config import DATASET_FILE
 from nemo_gym.tasks.harbor.dockerfile import OverlayRun
-from nemo_gym.tasks.harbor.image_configs import load_compose_document, without_main_build
+from nemo_gym.tasks.harbor.image_configs import ImageConfigError, load_compose_document, without_main_build
 from nemo_gym.tasks.harbor.materialize import HarborTaskInput
 from nemo_gym.tasks.harbor.models import HarborArtifact, HarborEnvironment
 from nemo_gym.tasks.harbor.task import BUILT_IMAGES_FILE, HarborTaskError, HarborTurn
@@ -205,6 +211,26 @@ class VerifierSettings:
     user: str | int | None
 
 
+class ComposeVariable(BaseModel):
+    """The deployment's value for one ``${NAME}`` a task's Compose file leaves undefined: exactly one source.
+
+    ``value`` is literal, ``env`` names a variable of this server's process, and ``model_server`` names a Gym
+    model server whose sandbox-reachable URL (with the episode's rollout prefix) becomes the value.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    value: str | None = None
+    env: str | None = None
+    model_server: str | None = None
+
+    @model_validator(mode="after")
+    def one_source(self) -> "ComposeVariable":
+        if sum(source is not None for source in (self.value, self.env, self.model_server)) != 1:
+            raise ValueError("A compose variable takes exactly one of value, env or model_server")
+        return self
+
+
 class HarborTasksetConfig(BaseModel):
     """Where one taskset's folders live and which digest each task was materialized with."""
 
@@ -244,6 +270,9 @@ class HarborEnvironmentServerConfig(BaseEnvironmentServerConfig):
     # Grant the task's `[[environment.mcp_servers]]` URL entries to the agent as MCP tool accesses. "off" keeps
     # them in /tmp/.nemo-gym/task.json only; "required" makes an agent that cannot connect fail its seed.
     task_mcp_grants: Literal["off", "optional", "required"] = "off"
+    # Values for the `${NAME}` references a task's Compose file leaves to the deployment, such as a sidecar's
+    # model endpoint and key. Resolved at seed; the task and Harbor's own variables take precedence.
+    compose_variables: dict[str, ComposeVariable] = Field(default_factory=dict)
 
 
 @dataclass
@@ -755,11 +784,36 @@ class HarborEnvironmentServer(
             )
         return json.loads(path.read_text())
 
-    def _compose_document(self, task: HarborTask) -> dict[str, Any]:
+    def _compose_variable_values(self, episode_key: str | None) -> dict[str, str]:
+        """The deployment's ``compose_variables`` resolved for one episode.
+
+        A ``model_server`` value is that server's sandbox-reachable root URL with the episode's rollout prefix
+        (no training-capture segment), so a sidecar's model calls are kept with the rollout's evaluation
+        capture and never become training tokens. A missing environment variable or an unreachable model
+        server is a configuration error (422).
+        """
+        values: dict[str, str] = {}
+        for name, source in self.config.compose_variables.items():
+            if source.value is not None:
+                values[name] = source.value
+            elif source.env is not None:
+                if source.env not in os.environ:
+                    raise HTTPException(422, f"compose_variables.{name}: environment variable {source.env!r} is unset")
+                values[name] = os.environ[source.env]
+            else:
+                try:
+                    base_url = sandbox_server_url(source.model_server, require_reachable=True)
+                except Exception as exc:
+                    raise HTTPException(422, f"compose_variables.{name}: {type(exc).__name__}: {exc}") from exc
+                values[name] = apply_rollout_prefix(base_url, episode_key)
+        return values
+
+    def _compose_document(self, task: HarborTask, episode_key: str | None = None) -> dict[str, Any]:
         """The published overlay resolved against recorded image metadata, ready for the Compose adapter."""
         image_configs = self._compose_image_configs(task)
-        # The same reader prepare used: env_file inlined and ${VAR} resolved from the task, not the process.
-        document = load_compose_document(task)
+        # The same reader prepare used: env_file inlined and ${VAR} resolved from the task, not the process,
+        # plus the deployment's compose_variables for names the task leaves to it.
+        document = load_compose_document(task, operator_variables=self._compose_variable_values(episode_key))
         if task.built_image is not None:
             # Prepare built main from this file; the recorded image stands in for its build: and pull_policy.
             document = without_main_build(document)
@@ -777,11 +831,20 @@ class HarborEnvironmentServer(
         return document
 
     async def _create_compose(self, task: HarborTask, episode_key: str) -> AsyncSandboxCompose:
-        """Start the task's Compose group; the ``main`` service is the agent's sandbox."""
-        document = self._compose_document(task)
-        # Episode IDs are opaque caller input, never host paths: the document gets a fresh folder.
-        self._artifacts_dir.mkdir(parents=True, exist_ok=True)
-        path = Path(tempfile.mkdtemp(prefix="compose-", dir=self._artifacts_dir)) / "compose.yaml"
+        """Start the task's Compose group; the ``main`` service is the agent's sandbox.
+
+        The adapter reads the resolved document once, at start. With deployment values in it (which may be
+        credentials), it goes to a private folder removed right after start, never under ``artifacts_dir``.
+        """
+        document = self._compose_document(task, episode_key)
+        private = bool(self.config.compose_variables)
+        if private:
+            folder = Path(tempfile.mkdtemp(prefix="nemo-gym-compose-"))
+        else:
+            # Episode IDs are opaque caller input, never host paths: the document gets a fresh folder.
+            self._artifacts_dir.mkdir(parents=True, exist_ok=True)
+            folder = Path(tempfile.mkdtemp(prefix="compose-", dir=self._artifacts_dir))
+        path = folder / "compose.yaml"
         path.write_text(yaml.safe_dump(document, sort_keys=False))
         main_spec = self._sandbox_spec(task, task.workdir)
         # Sidecars keep their own image's default user; the task's USER belongs to the main image only.
@@ -796,7 +859,11 @@ class HarborEnvironmentServer(
         )
         # Ownership starts before start(): a group that fails half-way is still stopped whole.
         self._sandboxes[episode_key] = compose
-        await compose.start()
+        try:
+            await compose.start()
+        finally:
+            if private:
+                shutil.rmtree(folder, ignore_errors=True)
         return compose
 
     async def _set_default_user(self, sandbox: AsyncSandbox, task: HarborTask, names: dict[str, str]) -> None:
@@ -1306,6 +1373,13 @@ class HarborEnvironmentServer(
             resolve_env_templates(task.config.verifier.environment.env)
         for turn in task.turns:
             resolve_env_templates(turn.config.verifier.env)
+        if task.needs_compose:
+            # A Compose file the deployment leaves incomplete (a variable no compose_variables entry sets) is a
+            # configuration error: refused before anything is provisioned, and not retried.
+            try:
+                self._compose_document(task, episode_key)
+            except ImageConfigError as exc:
+                raise HTTPException(422, f"Compose file of task {task.task_id!r}: {exc}") from exc
         if task.turns:
             budget = sum(
                 task.config.step_agent_timeout_sec(turn.config)
