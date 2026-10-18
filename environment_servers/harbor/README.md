@@ -54,8 +54,27 @@ the task folders, written by `gym dataset fetch`; on OpenSandbox the provider bl
 `benchmarks/terminal_bench_4/resources.yaml` shows. `[environment.healthcheck]` is polled at seed.
 Tasks that declare GPUs run on the `gpu_sandbox_provider` block when one is set. The task's
 `[[environment.mcp_servers]]` and `skills_dir` are written to `/tmp/.nemo-gym/task.json` in the agent's
-sandbox for harnesses that drive task MCP servers from inside it (mini-SWE does). Dockerfiles outside pull
-and overlay mode are built at prepare, see below. Multi-step tasks come in a later milestone.
+sandbox for harnesses that drive task MCP servers from inside it (mini-SWE does). With `task_mcp_grants:
+optional` or `required`, the `streamable-http` URL entries are also granted to the agent as MCP tool
+accesses, as declared; a Compose sidecar's URL names its service, which resolves inside the task's group.
+Dockerfiles outside pull and overlay mode are built at prepare, see below.
+
+## Multi-step tasks
+
+A task with `[[steps]]` runs each step as one turn in the same sandbox, as Harbor's multi-step trial does
+without `resume_trajectory`: a fresh agent session per turn, with the step's
+`steps/<name>/instruction.md` as its only input and the step's `[steps.agent].timeout_sec` (else the task's)
+as its budget. The task's top-level `instruction.md` is never sent; a multi-step task may keep material there
+the agent must not see. After each turn the shared verifier runs the task's `tests/` with
+`steps/<name>/tests/` on top, under the step's verifier timeout, user and environment over the task's.
+
+The episode stops after a turn that is masked, writes no valid reward file, or misses the step's
+`min_reward` (a number gates `reward`, a table gates each named key). `multi_step_reward_strategy` rolls the
+turns up: `mean` (the default) averages the turns with a verifier result, and `final` takes the last turn that
+ran. The result lists every turn under `turns`; its `response` and `ng_agent_observations` are the last
+turn's. Per-step `workdir/`, `setup.sh`, healthchecks, artifacts and separate verification are refused by the
+loader. A long task's turns can budget more than `default_episode_timeout_seconds`; the seed logs a warning,
+because an expired episode is retried rather than scored.
 
 ## Dockerfile builds
 
@@ -198,7 +217,7 @@ it is, the other providers cannot run commands as it.
 | Network restrictions | Public networking only. Restricted network modes, host allowlists and deny rules are rejected by the loader rather than silently ignored. |
 | Artifacts and hooks | Verifier logs are downloaded. Artifact `exclude` rules and shared-mode collect hooks are not implemented in this layer. |
 | Image ENTRYPOINT | No Harbor-compatible entrypoint lifecycle is guaranteed; startup follows the selected Gym sandbox provider. Tasks must not rely on an entrypoint running. |
-| Other features | Multi-step tasks, in-sandbox MCP tools, Windows and TPU environments are unsupported. |
+| Other features | Windows and TPU environments are unsupported. Multi-step tasks run as turns (see above). |
 
 Clearing `/tests` and `/logs/verifier` before verification is a deliberate difference from Harbor's
 single-step shared mode, which merges tests. It prevents agent-planted reward files or test helpers

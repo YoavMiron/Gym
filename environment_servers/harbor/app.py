@@ -74,7 +74,7 @@ from nemo_gym.base_responses_api_agent import (
     AgentSeedSessionResponse,
 )
 from nemo_gym.config_types import TOKEN_CAPTURE_PATH_SEGMENT, AgentServerRef, AggregateMetrics, AggregateMetricsRequest
-from nemo_gym.episode_types import BaseEpisodeResponse, EpisodeId, TaskId
+from nemo_gym.episode_types import BaseEpisodeRequest, BaseEpisodeResponse, EpisodeId, TaskId
 from nemo_gym.global_config import TOKEN_ID_CAPTURE_BLOCK, get_first_server_config_dict, get_global_config_dict
 from nemo_gym.openai_utils import NeMoGymResponse
 from nemo_gym.reward_profile import AggregateMetricsMixin, compute_aggregate_metrics
@@ -85,13 +85,15 @@ from nemo_gym.sandbox.compose_config import adapt_non_root_sidecars, opensandbox
 from nemo_gym.sandbox.config import resolve_provider_config, resolve_provider_metadata
 from nemo_gym.sandbox.providers.base import ORPHAN_REAP_TIMEOUT_S
 from nemo_gym.server_utils import get_response_json, is_nemo_gym_fastapi_entrypoint, raise_for_status
-from nemo_gym.single_agent_turn_types import SingleAgentTurnFailure, SingleAgentTurnRequest, SingleAgentTurnResult
+from nemo_gym.single_agent_turn_types import SingleAgentTurnFailure, SingleAgentTurnResult
 from nemo_gym.tasks.harbor import DIGEST_KEY, HarborTask, load_task
 from nemo_gym.tasks.harbor.dataset_config import DATASET_FILE
 from nemo_gym.tasks.harbor.dockerfile import OverlayRun
 from nemo_gym.tasks.harbor.image_configs import load_compose_document, without_main_build
+from nemo_gym.tasks.harbor.materialize import HarborTaskInput
 from nemo_gym.tasks.harbor.models import HarborArtifact, HarborEnvironment
-from nemo_gym.tasks.harbor.task import BUILT_IMAGES_FILE, HarborTaskError
+from nemo_gym.tasks.harbor.task import BUILT_IMAGES_FILE, HarborTaskError, HarborTurn
+from nemo_gym.tool_access import MCPStreamableHTTPConnection, MCPToolAccess, ToolAccess
 
 
 LOGGER = logging.getLogger(__name__)
@@ -109,6 +111,8 @@ VERIFIER_STDOUT = f"{VERIFIER_LOGS_DIR}/test-stdout.txt"
 VERIFIER_TIMEOUT_KIND = "harbor:verifier_timeout"
 MISSING_REWARD_KIND = "harbor:missing_reward"
 INVALID_REWARD_KIND = "harbor:invalid_reward"
+# A multi-turn episode in which no turn produced a verifier result to roll up.
+NO_TURN_RESULT_KIND = "harbor:no_turn_result"
 # Added to `sandbox_ready_timeout_s` for this server's own deadline on a create. The provider caps its create
 # request at the ready timeout, so a pod that never schedules fails the request by then; the grace is room for
 # the provider to find and delete what that create left behind (its orphan-reap allowance) and report what it
@@ -136,11 +140,37 @@ class HarborOverlayUnavailable(RuntimeError):
     """The sandbox provider could not run an overlay step at all (not the step failing): retry elsewhere."""
 
 
+class HarborTurnResult(BaseModel):
+    """One turn of a multi-step task: what the agent returned and what the step's verifier wrote.
+
+    ``verifier_rewards`` is ``None`` when the turn produced no verifier result (``test.sh`` timed out
+    or wrote no valid reward file); such a turn ends the episode.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    reward: float
+    verifier_rewards: dict[str, float] | None = None
+    mask_sample: bool = False
+    failure_kind: str | None = None
+    failure_reason: str | None = None
+    verifier_return_code: int | None = None
+    verifier_logs_dir: str | None = None
+    verifier_seconds: float | None = None
+    response: NeMoGymResponse
+    agent_observations: AgentObservationBundle | None = None
+
+
 class HarborEpisodeResult(SingleAgentTurnResult):
     """The episode's verify response plus what the Harbor verifier produced.
 
     ``verifier_rewards`` is the parsed ``reward.json`` (``reward.txt`` becomes ``{"reward": value}``).
     The ``verifier_*`` fields are ``None`` when ``test.sh`` never ran.
+
+    A multi-step task fills ``turns`` in order. The top-level reward follows
+    ``turn_reward_strategy`` over them (Harbor's ``multi_step_reward_strategy``), and ``response``,
+    ``responses_create_params`` and ``ng_agent_observations`` are those of the last turn that ran.
     """
 
     verifier_rewards: dict[str, float] | None = None
@@ -149,12 +179,30 @@ class HarborEpisodeResult(SingleAgentTurnResult):
     verifier_seconds: float | None = None
     # "shared": test.sh ran in the agent's sandbox; "separate": in its own sandbox from [verifier.environment].
     verifier_mode: Literal["shared", "separate"] | None = None
+    turns: list[HarborTurnResult] | None = None
+    turn_reward_strategy: Literal["mean", "final"] | None = None
+    turns_without_verifier_result: int | None = None
+    # The turn after which the episode stopped early: a mask, no verifier result, or a missed min_reward.
+    stopped_after_turn: str | None = None
+
+
+class HarborEpisodeRequest(BaseEpisodeRequest[HarborTaskInput]):
+    """Request for one Harbor episode: one turn, or a multi-step task's steps as turns."""
 
 
 class HarborEpisodeResponse(BaseEpisodeResponse[HarborEpisodeResult]):
     """Response for one Harbor episode: a result, or a staged failure with the agent's evidence."""
 
     failure: SingleAgentTurnFailure | None = None
+
+
+@dataclass(frozen=True)
+class VerifierSettings:
+    """The verifier settings one ``test.sh`` run uses: the task's, or a step's over the task's."""
+
+    timeout_sec: float
+    env: dict[str, str]
+    user: str | int | None
 
 
 class HarborTasksetConfig(BaseModel):
@@ -193,6 +241,9 @@ class HarborEnvironmentServerConfig(BaseEnvironmentServerConfig):
     verifier_grace_s: float = Field(default=30, ge=0)
     # Verifier logs are downloaded here, one fresh folder per verification.
     artifacts_dir: Path | None = None
+    # Grant the task's `[[environment.mcp_servers]]` URL entries to the agent as MCP tool accesses. "off" keeps
+    # them in /tmp/.nemo-gym/task.json only; "required" makes an agent that cannot connect fail its seed.
+    task_mcp_grants: Literal["off", "optional", "required"] = "off"
 
 
 @dataclass
@@ -290,6 +341,50 @@ def select_reward(rewards: dict[str, float]) -> float | None:
     if len(rewards) == 1:
         return next(iter(rewards.values()))
     return None
+
+
+def min_reward_failure(rewards: dict[str, float] | None, min_reward: float | dict[str, float] | None) -> str | None:
+    """Why a turn misses its step's ``min_reward``, or ``None`` when it passes or sets none.
+
+    As in Harbor, a number gates the ``reward`` key, a mapping gates each key it names, and a key the
+    rewards lack (or a turn without a verifier result) counts as negative infinity.
+    """
+    if min_reward is None:
+        return None
+    thresholds = {"reward": float(min_reward)} if isinstance(min_reward, (int, float)) else min_reward
+    for key, threshold in thresholds.items():
+        actual = (rewards or {}).get(key, float("-inf"))
+        if actual < threshold:
+            return f"{key}={actual} is below min_reward {threshold}"
+    return None
+
+
+def roll_up_turns(turns: list["HarborTurnResult"], strategy: str) -> dict[str, Any]:
+    """The episode's reward fields from its turns, by Harbor's ``multi_step_reward_strategy``.
+
+    A masked turn masks the episode. ``final`` is the last turn that ran, as Harbor takes the last step
+    result. ``mean`` averages over the turns that produced a verifier result: the reward is the mean of
+    their rewards, and ``verifier_rewards`` the per-key means with a key a turn lacks counting 0. With
+    nothing to roll up the episode is measured 0, as a single turn without a reward file is.
+    """
+    masked = next((turn for turn in turns if turn.mask_sample), None)
+    if masked is not None:
+        reason = f"turn {masked.name!r}: {masked.failure_reason}"[:2000]
+        return {"reward": 0.0, "mask_sample": True, "failure_kind": masked.failure_kind, "failure_reason": reason}
+    if strategy == "final":
+        last = turns[-1]
+        if last.verifier_rewards is None:
+            reason = f"turn {last.name!r}: {last.failure_reason}"[:2000]
+            return {"reward": 0.0, "mask_sample": False, "failure_kind": last.failure_kind, "failure_reason": reason}
+        return {"reward": last.reward, "verifier_rewards": last.verifier_rewards}
+    measured = [turn for turn in turns if turn.verifier_rewards is not None]
+    if not measured:
+        last = turns[-1]
+        reason = f"no turn produced a verifier result; turn {last.name!r}: {last.failure_reason}"
+        return HarborEnvironmentServer._measured(0.0, last.failure_kind or NO_TURN_RESULT_KIND, reason)
+    keys = sorted({key for turn in measured for key in turn.verifier_rewards})
+    means = {key: sum(turn.verifier_rewards.get(key, 0.0) for turn in measured) / len(measured) for key in keys}
+    return {"reward": sum(turn.reward for turn in measured) / len(measured), "verifier_rewards": means}
 
 
 def _is_root(user: str | None) -> bool:
@@ -402,10 +497,10 @@ def _needs_gpu(task: HarborTask) -> bool:
 
 
 class HarborEnvironmentServer(
-    BaseEnvironmentServer[SingleAgentTurnRequest, HarborEpisodeResponse], AggregateMetricsMixin
+    BaseEnvironmentServer[HarborEpisodeRequest, HarborEpisodeResponse], AggregateMetricsMixin
 ):
     config: HarborEnvironmentServerConfig
-    request_model = SingleAgentTurnRequest
+    request_model = HarborEpisodeRequest
     response_model = HarborEpisodeResponse
 
     def model_post_init(self, context: Any, /) -> None:
@@ -915,7 +1010,7 @@ class HarborEnvironmentServer(
 
     # -- the episode -----------------------------------------------------------------------
 
-    async def run(self, request: SingleAgentTurnRequest, cleanup: CleanupContext) -> HarborEpisodeResponse:
+    async def run(self, request: HarborEpisodeRequest, cleanup: CleanupContext) -> HarborEpisodeResponse:
         episode_key = request.episode_id.capture_key
         task_input = request.task.task_input
 
@@ -955,6 +1050,44 @@ class HarborEnvironmentServer(
             # seed failure, retried elsewhere; the cleanup stops what was claimed.
             raise self._failure(stage="seed", failure_reason=f"{type(error).__name__}: {error}", terminal=False)
 
+        if task_input.turns:
+            return await self._run_turns(request, session, access, cleanup)
+
+        agent_response, agent_observations = await self._agent_turn(
+            request, access, task_input.responses_create_params, cleanup, session.task
+        )
+        try:
+            outcome = await self._run_verifier(session)
+        except HTTPException as error:
+            raise self._failure(
+                stage="verification",
+                failure_reason=str(error.detail),
+                terminal=error.status_code < 500,
+                partial_response=agent_response,
+                agent_observations=agent_observations,
+            ) from error
+
+        result = HarborEpisodeResult(
+            responses_create_params=task_input.responses_create_params,
+            response=agent_response,
+            **outcome,
+            ng_agent_observations=agent_observations,
+        )
+        return HarborEpisodeResponse(episode_id=request.episode_id, task_id=request.task.task_id, result=result)
+
+    async def _agent_turn(
+        self,
+        request: HarborEpisodeRequest,
+        access: SandboxAccess,
+        responses_create_params: Any,
+        cleanup: CleanupContext,
+        task: HarborTask,
+    ) -> tuple[NeMoGymResponse, AgentObservationBundle | None]:
+        """One agent turn in its own session on the episode's sandbox: seed, one activation, close.
+
+        The session is closed before this returns, so the harness has let go of the sandbox and its
+        observations are in hand. A failed seed or activation raises the staged episode failure.
+        """
         agent_session_id = f"agent-session-{uuid4().hex}"
         agent_cookies: dict[str, str] = {}
         agent_observations: AgentObservationBundle | None = None
@@ -989,6 +1122,7 @@ class HarborEnvironmentServer(
                     agent_session_id=agent_session_id,
                     episode_id=request.episode_id,
                     task_id=request.task.task_id,
+                    tool_accesses=self._task_tool_accesses(task),
                     sandbox_access=access,
                 ).model_dump(mode="json"),
             )
@@ -1011,7 +1145,7 @@ class HarborEnvironmentServer(
             agent_http_response = await self.server_client.post(
                 server_name=self.config.agent_server.name,
                 url_path=self._agent_responses_path(request),
-                json=task_input.responses_create_params,
+                json=responses_create_params,
                 cookies=agent_cookies,
             )
             await raise_for_status(agent_http_response)
@@ -1043,27 +1177,114 @@ class HarborEnvironmentServer(
                 terminal=not _is_retryable_dependency_error(error),
                 partial_response=agent_response,
             ) from error
+        return agent_response, agent_observations
 
-        try:
-            outcome = await self._run_verifier(session)
-        except HTTPException as error:
+    async def _run_turns(
+        self,
+        request: HarborEpisodeRequest,
+        session: HarborSession,
+        access: SandboxAccess,
+        cleanup: CleanupContext,
+    ) -> HarborEpisodeResponse:
+        """Run a multi-step task's steps as turns on one sandbox, as Harbor's multi-step trial does.
+
+        Each turn opens a fresh agent session (Harbor's default, ``resume_trajectory = false``), sends the
+        step's instruction, closes the session and runs the step's verifier: the task's ``tests/`` with
+        ``steps/<name>/tests/`` on top. The episode stops after a turn that is masked, produces no verifier
+        result, or misses its ``min_reward``; the remaining turns do not run.
+        """
+        task = session.task
+        inputs = request.task.task_input.turns
+        if [turn.name for turn in inputs] != [turn.name for turn in task.turns]:
             raise self._failure(
-                stage="verification",
-                failure_reason=str(error.detail),
-                terminal=error.status_code < 500,
-                partial_response=agent_response,
-                agent_observations=agent_observations,
-            ) from error
+                stage="seed",
+                failure_reason=(
+                    f"Row turns {[turn.name for turn in inputs]} do not match the steps of task {task.task_id!r} "
+                    f"{[turn.name for turn in task.turns]}; re-materialize the taskset"
+                ),
+                terminal=True,
+            )
+        results: list[HarborTurnResult] = []
+        stopped_after: str | None = None
+        for turn, turn_input in zip(task.turns, inputs):
+            response, observations = await self._agent_turn(
+                request, access, turn_input.responses_create_params, cleanup, task
+            )
+            try:
+                outcome = await self._run_shared_verifier(
+                    session,
+                    settings=self._turn_verifier_settings(task, turn),
+                    test_dirs=(task.path / "tests", task.path / turn.tests_dir),
+                )
+            except HTTPException as error:
+                raise self._failure(
+                    stage="verification",
+                    failure_reason=f"turn {turn.name!r}: {error.detail}",
+                    terminal=error.status_code < 500,
+                    partial_response=response,
+                    agent_observations=observations,
+                ) from error
+            result = HarborTurnResult(name=turn.name, response=response, agent_observations=observations, **outcome)
+            results.append(result)
+            if (
+                result.mask_sample
+                or result.verifier_rewards is None
+                or min_reward_failure(result.verifier_rewards, turn.config.min_reward) is not None
+            ):
+                stopped_after = turn.name if len(results) < len(task.turns) else None
+                break
 
-        result = HarborEpisodeResult(
-            responses_create_params=task_input.responses_create_params,
-            response=agent_response,
-            **outcome,
-            ng_agent_observations=agent_observations,
+        strategy = task.config.multi_step_reward_strategy
+        last = results[-1]
+        episode = HarborEpisodeResult(
+            responses_create_params=inputs[len(results) - 1].responses_create_params,
+            response=last.response,
+            ng_agent_observations=last.agent_observations,
+            verifier_mode="shared",
+            turns=results,
+            turn_reward_strategy=strategy,
+            turns_without_verifier_result=sum(1 for result in results if result.verifier_rewards is None),
+            stopped_after_turn=stopped_after,
+            **roll_up_turns(results, strategy),
         )
-        return HarborEpisodeResponse(episode_id=request.episode_id, task_id=request.task.task_id, result=result)
+        return HarborEpisodeResponse(episode_id=request.episode_id, task_id=request.task.task_id, result=episode)
 
-    async def _seed(self, request: SingleAgentTurnRequest, episode_key: str) -> HarborSession:
+    @staticmethod
+    def _turn_verifier_settings(task: HarborTask, turn: HarborTurn) -> VerifierSettings:
+        """A step's verifier settings over the task's, as Harbor resolves them."""
+        step = turn.config.verifier
+        return VerifierSettings(
+            timeout_sec=task.config.step_verifier_timeout_sec(turn.config),
+            env=task.config.verifier.env | step.env,
+            user=step.user if step.user is not None else task.config.verifier.user,
+        )
+
+    def _task_tool_accesses(self, task: HarborTask) -> list[ToolAccess]:
+        """The task's MCP servers as agent tool grants, when ``task_mcp_grants`` asks for them.
+
+        Only URL entries reached over streamable HTTP can be granted; a Compose sidecar's URL names its
+        service host, which resolves inside the task's sandbox group, where the harness runs.
+        """
+        if self.config.task_mcp_grants == "off":
+            return []
+        accesses: list[ToolAccess] = []
+        for server in task.config.environment.mcp_servers:
+            if server.transport != "streamable-http" or not server.url:
+                LOGGER.warning(
+                    f"{task.task_id}: MCP server {server.name!r} ({server.transport}) cannot be granted; "
+                    "only streamable-http URL entries can"
+                )
+                continue
+            accesses.append(
+                MCPToolAccess(
+                    name=server.name,
+                    required=self.config.task_mcp_grants == "required",
+                    connection=MCPStreamableHTTPConnection(url=server.url),
+                )
+            )
+        return accesses
+
+    async def _seed(self, request: HarborEpisodeRequest, episode_key: str) -> HarborSession:
         """Resolve the task and start its sandbox; the sandbox stays owned by the server until it is stopped."""
         if self._shutting_down:
             raise HTTPException(503, "Environment server is shutting down")
@@ -1083,6 +1304,21 @@ class HarborEnvironmentServer(
         resolve_env_templates(task.config.verifier.env)
         if task.config.verifier.environment is not None:
             resolve_env_templates(task.config.verifier.environment.env)
+        for turn in task.turns:
+            resolve_env_templates(turn.config.verifier.env)
+        if task.turns:
+            budget = sum(
+                task.config.step_agent_timeout_sec(turn.config)
+                + task.config.step_verifier_timeout_sec(turn.config)
+                + self.config.verifier_grace_s
+                for turn in task.turns
+            )
+            if budget > self.config.default_episode_timeout_seconds:
+                # An expired episode is retried, not scored, so a task this long may never finish here.
+                LOGGER.warning(
+                    f"{task.task_id}: its turns budget up to {budget:.0f}s of agent and verifier time, above "
+                    f"default_episode_timeout_seconds={self.config.default_episode_timeout_seconds:.0f}"
+                )
         if self._shutting_down:
             raise HTTPException(503, "Environment server is shutting down")
         for stale_key in (episode_key, _verifier_key(episode_key)):
@@ -1142,7 +1378,7 @@ class HarborEnvironmentServer(
         self._sessions[episode_key] = session
         return session
 
-    def _agent_responses_path(self, request: SingleAgentTurnRequest) -> str:
+    def _agent_responses_path(self, request: HarborEpisodeRequest) -> str:
         block = self.server_client.global_config_dict.get(TOKEN_ID_CAPTURE_BLOCK) or {}
         agent_config = get_first_server_config_dict(
             self.server_client.global_config_dict,
@@ -1334,11 +1570,25 @@ class HarborEnvironmentServer(
             task, settings, result, logs_dir, started, timed_out=timed_out, rewards=rewards, problem=problem
         )
 
-    async def _run_shared_verifier(self, session: HarborSession) -> dict[str, Any]:
-        """Run ``tests/test.sh`` in the agent's sandbox and read the reward it wrote."""
+    async def _run_shared_verifier(
+        self,
+        session: HarborSession,
+        *,
+        settings: VerifierSettings | None = None,
+        test_dirs: tuple[Path, ...] | None = None,
+    ) -> dict[str, Any]:
+        """Run ``test.sh`` in the agent's sandbox and read the reward it wrote.
+
+        ``test_dirs`` are uploaded to ``/tests`` in order, each over the last (a step's ``tests/`` over the
+        task's); missing folders are skipped. By default the task's ``tests/`` and ``[verifier]`` apply.
+        """
         task = session.task
         sandbox = session.sandbox
-        settings = task.config.verifier
+        if settings is None:
+            verifier = task.config.verifier
+            settings = VerifierSettings(timeout_sec=verifier.timeout_sec, env=verifier.env, user=verifier.user)
+        if test_dirs is None:
+            test_dirs = (task.path / "tests",)
         started = asyncio.get_running_loop().time()
         try:
             logs_dir = self._reserve_logs_dir()
@@ -1367,7 +1617,9 @@ class HarborEnvironmentServer(
             )
             if prepare.return_code != 0:
                 raise RuntimeError(f"Could not prepare verifier directories: {prepare.stderr or prepare.stdout}")
-            await upload_dir(sandbox, task.path / "tests", TESTS_DIR)
+            for tests in test_dirs:
+                if tests.is_dir():
+                    await upload_dir(sandbox, tests, TESTS_DIR)
             # One plain exec for the whole run. The provider keeps it alive for as long as
             # `timeout_s` says (OpenSandbox polls a background command, Docker streams), and
             # `timeout` inside the container is the cap that stops the tests themselves.

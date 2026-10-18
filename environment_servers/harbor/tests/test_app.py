@@ -28,6 +28,7 @@ from environment_servers.harbor.app import (
     SEED_CREATE_GRACE_S,
     HarborEnvironmentServer,
     HarborEnvironmentServerConfig,
+    HarborEpisodeRequest,
     HarborEpisodeResponse,
     _verifier_image,
     overlay_shell_command,
@@ -41,7 +42,6 @@ from nemo_gym.config_types import AggregateMetricsRequest
 from nemo_gym.openai_utils import NeMoGymResponse
 from nemo_gym.sandbox.providers.base import SandboxExecResult, SandboxSpec
 from nemo_gym.server_utils import BaseServerConfig, ServerClient
-from nemo_gym.single_agent_turn_types import SingleAgentTurnRequest
 from nemo_gym.tasks.harbor import DIGEST_KEY, load_task
 from nemo_gym.tasks.harbor.dockerfile import OverlayRun
 from nemo_gym.tasks.harbor.models import HarborEnvironment
@@ -353,8 +353,8 @@ def make_server(
     return server, task, sandbox, created
 
 
-def episode(task, *, rollout="r1", attempt=0, digest=None, task_id="hello", taskset="ds") -> SingleAgentTurnRequest:
-    return SingleAgentTurnRequest.model_validate(
+def episode(task, *, rollout="r1", attempt=0, digest=None, task_id="hello", taskset="ds") -> HarborEpisodeRequest:
+    return HarborEpisodeRequest.model_validate(
         {
             "episode_id": {"rollout_id": rollout, "attempt": attempt},
             "task": {
@@ -2014,6 +2014,7 @@ def test_server_config_holds_only_deployment_settings():
         "request_gpu_type",
         "verifier_grace_s",
         "artifacts_dir",
+        "task_mcp_grants",
     }
     source = inspect.getsource(HarborEnvironmentServerConfig).lower()
     assert not any(word in source for word in ("terminal", "tb4", "tb2", "swe", "nextjs", "hello-world"))
